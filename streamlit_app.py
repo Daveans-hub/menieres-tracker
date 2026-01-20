@@ -4,74 +4,74 @@ import requests
 import datetime
 import pandas as pd
 
-# --- APP CONFIG ---
 st.set_page_config(page_title="Meniere's Helper", layout="centered")
 
-# --- SETUP API KEYS (We will hide these later) ---
-# For now, we will put them in the sidebar for testing
-st.sidebar.header("Settings")
+# --- SIDEBAR SETTINGS ---
+st.sidebar.header("🔑 API Keys")
 gemini_key = st.sidebar.text_input("Google AI Key", type="password")
-weather_key = st.sidebar.text_input("OpenWeather Key (Optional)", type="password")
+fb_token = st.sidebar.text_input("Fitbit Access Token", type="password")
 
 if gemini_key:
     genai.configure(api_key=gemini_key)
 
 st.title("👂 Meniere's Tracker")
 
-# --- DATABASE (Simulated for now) ---
+# Temporary data storage (We will connect Google Sheets in the next step!)
 if 'data_log' not in st.session_state:
     st.session_state.data_log = []
 
-# --- TAB 1: LOG DIZZY SPELL ---
-tab1, tab2, tab3 = st.tabs(["Dizzy Log", "Food Scanner", "History"])
+tab1, tab2, tab3 = st.tabs(["🚨 Emergency Log", "🍽️ Food Scanner", "📊 History"])
 
+# --- TAB 1: DIZZY LOG & FITBIT ---
 with tab1:
-    st.header("Emergency Log")
-    if st.button("🚨 LOG DIZZY SPELL NOW", use_container_width=True):
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        
-        # Get Weather info automatically
-        pressure = "1013" # Default if no key
-        if weather_key:
-            try:
-                res = requests.get(f"https://api.openweathermap.org/data/2.5/weather?q=Auckland&appid={weather_key}").json()
-                pressure = res['main']['pressure']
-            except:
-                pass
-        
-        entry = {"Date": now, "Type": "Dizzy Spell", "Pressure": pressure, "Details": "Vertigo Triggered"}
-        st.session_state.data_log.append(entry)
-        st.success(f"Logged at {now}. Barometric Pressure: {pressure} hPa")
+    st.header("Log Dizzy Spell")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🚨 LOG SPELL NOW", use_container_width=True):
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            
+            # Fetch Fitbit data automatically if token is there
+            fb_data = {"Sleep": "N/A", "HRV": "N/A", "RHR": "N/A", "SpO2": "N/A", "Temp": "N/A"}
+            if fb_token:
+                headers = {"Authorization": f"Bearer {fb_token}"}
+                try:
+                    # Fetch Sleep
+                    slp = requests.get("https://api.fitbit.com/1.2/user/-/sleep/date/today.json", headers=headers).json()
+                    fb_data["Sleep"] = slp['summary']['totalMinutesAsleep']
+                    # Fetch Heart (RHR)
+                    hrt = requests.get("https://api.fitbit.com/1/user/-/activities/heart/date/today/1d.json", headers=headers).json()
+                    fb_data["RHR"] = hrt['activities-heart'][0]['value']['restingHeartRate']
+                except:
+                    st.warning("Fitbit token expired or invalid.")
 
-# --- TAB 2: FOOD SCANNER ---
+            entry = {"Date": now, "Type": "Dizzy Spell", **fb_data}
+            st.session_state.data_log.append(entry)
+            st.success(f"Logged! Fitbit stats captured.")
+
+# --- TAB 2: FOOD AI ---
 with tab2:
-    st.header("Food & Drink AI")
-    uploaded_file = st.file_uploader("Take a photo of your meal/water", type=["jpg", "png", "jpeg"])
+    st.header("AI Food Analyzer")
+    uploaded_file = st.file_uploader("Snap a photo", type=["jpg", "png", "jpeg"])
     
     if uploaded_file and gemini_key:
-        st.image(uploaded_file, caption="Processing...", width=300)
-        
-        if st.button("Analyze with AI"):
+        if st.button("Analyze Meal"):
             model = genai.GenerativeModel('gemini-1.5-flash')
-            # Convert image to bytes for AI
-            img_bytes = uploaded_file.getvalue()
-            
             response = model.generate_content([
-                "Estimate Sodium (mg), Caffeine (mg), and Water (oz) in this photo. Return a simple list.",
-                {"mime_type": "image/jpeg", "data": img_bytes}
+                "Estimate Sodium (mg), Caffeine (mg), and Water (oz). Return a simple list.",
+                {"mime_type": "image/jpeg", "data": uploaded_file.getvalue()}
             ])
-            
             st.info(response.text)
-            
-            # Save to history
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            st.session_state.data_log.append({"Date": now, "Type": "Food Log", "Details": response.text})
+            st.session_state.data_log.append({
+                "Date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 
+                "Type": "Meal", 
+                "Details": response.text
+            })
 
 # --- TAB 3: HISTORY ---
 with tab3:
-    st.header("Recent Logs")
+    st.header("Log History")
     if st.session_state.data_log:
-        df = pd.DataFrame(st.session_state.data_log)
-        st.table(df)
+        st.dataframe(pd.DataFrame(st.session_state.data_log))
     else:
-        st.write("No logs yet today.")
+        st.write("No entries yet.")
