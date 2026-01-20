@@ -1,4 +1,4 @@
 google-generativeai
 requests
 pandas
-gspread
+st-gsheets-connection
