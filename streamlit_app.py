@@ -1,80 +1,113 @@
 import streamlit as st
 import google.generativeai as genai
 import requests
-from requests_oauthlib import OAuth2Session
+import base64
 import datetime
 import pandas as pd
 
-# --- CONFIG & SECRETS ---
+# --- APP CONFIG & SECRETS ---
 st.set_page_config(page_title="Meniere's Tracker", layout="centered")
-CLIENT_ID = st.secrets["FITBIT_CLIENT_ID"]
-CLIENT_SECRET = st.secrets["FITBIT_CLIENT_SECRET"]
-REDIRECT_URI = st.secrets["FITBIT_REDIRECT_URI"]
-SCOPE = ["activity", "heartrate", "location", "nutrition", "profile", "settings", "sleep", "oxygen_saturation", "temperature"]
+
+# Get secrets from Streamlit Vault
+try:
+    CLIENT_ID = st.secrets["FITBIT_CLIENT_ID"]
+    CLIENT_SECRET = st.secrets["FITBIT_CLIENT_SECRET"]
+    REDIRECT_URI = st.secrets["FITBIT_REDIRECT_URI"]
+    GEMINI_KEY = st.secrets["GEMINI_KEY"]
+    WEATHER_KEY = st.secrets["OPENWEATHER_KEY"]
+    genai.configure(api_key=GEMINI_KEY)
+except Exception as e:
+    st.error("Missing Secrets in Streamlit Settings!")
+    st.stop()
 
 st.title("👂 Meniere's Tracker")
 
-# --- FITBIT LOGIN LOGIC ---
+# --- OAUTH HELPERS ---
 if 'fb_token' not in st.session_state:
     st.session_state.fb_token = None
 
-# 1. Start the Login Process
-fitbit = OAuth2Session(CLIENT_ID, redirect_uri=REDIRECT_URI, scope=SCOPE)
+# This encodes your ID and Secret for Fitbit
+auth_header = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
 
-# Check if we are returning from a Fitbit login
-query_params = st.query_params
-if "code" in query_params and not st.session_state.fb_token:
-    auth_code = query_params["code"]
-    token = fitbit.fetch_token(
-        "https://api.fitbit.com/oauth2/token",
-        code=auth_code,
-        client_secret=CLIENT_SECRET,
-        include_client_id=True
-    )
-    st.session_state.fb_token = token
-    st.success("Successfully connected to Fitbit!")
+# --- LOGIN LOGIC ---
+# 1. Check if we just returned from Fitbit with a 'code'
+if "code" in st.query_params and st.session_state.fb_token is None:
+    code = st.query_params["code"]
+    
+    # Exchange code for token
+    token_url = "https://api.fitbit.com/oauth2/token"
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id": CLIENT_ID
+    }
+    headers = {
+        "Authorization": f"Basic {auth_header}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    
+    res = requests.post(token_url, data=data, headers=headers).json()
+    
+    if "access_token" in res:
+        st.session_state.fb_token = res
+        st.query_params.clear() # Clear the URL so it doesn't error on refresh
+        st.rerun()
+    else:
+        st.error(f"Login failed: {res.get('errors')}")
 
-# Show Login Button if not connected
+# 2. If not logged in, show the button
 if not st.session_state.fb_token:
-    authorization_url, state = fitbit.authorization_url("https://www.fitbit.com/oauth2/authorize")
-    st.link_button("🔗 Login with Fitbit", authorization_url, use_container_width=True)
-    st.info("Please login to Fitbit to capture your health data.")
-    st.stop() # Stops the rest of the app until login is done
+    scope = "activity heartrate nutrition profile sleep oxygen_saturation temperature"
+    login_url = f"https://www.fitbit.com/oauth2/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&scope={scope}"
+    st.link_button("🔗 Step 1: Login with Fitbit", login_url, use_container_width=True)
+    st.info("Click the button above to authorize the app.")
+    st.stop()
 
-# --- APP TABS (Only visible after login) ---
-tab1, tab2, tab3 = st.tabs(["🚨 Emergency Log", "🍽️ Food AI", "📊 History"])
+# --- THE APP (Only shows after login) ---
+st.success("✅ Fitbit Connected")
 
-def get_fb_stats():
+tab1, tab2, tab3 = st.tabs(["🚨 Log Spell", "🍽️ Food AI", "📊 History"])
+
+def fetch_fitbit():
     token = st.session_state.fb_token['access_token']
     headers = {"Authorization": f"Bearer {token}"}
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    stats = {}
-    
+    date = datetime.datetime.now().strftime("%Y-%m-%d")
+    data = {}
     try:
         # Sleep
-        s = requests.get(f"https://api.fitbit.com/1.2/user/-/sleep/date/{today}.json", headers=headers).json()
-        stats["Sleep Score"] = s['summary']['totalMinutesAsleep']
+        s = requests.get(f"https://api.fitbit.com/1.2/user/-/sleep/date/{date}.json", headers=headers).json()
+        data["Sleep_Min"] = s['summary']['totalMinutesAsleep']
         # Heart
-        h = requests.get(f"https://api.fitbit.com/1/user/-/activities/heart/date/{today}/1d.json", headers=headers).json()
-        stats["RHR"] = h['activities-heart'][0]['value']['restingHeartRate']
-        # HRV
-        hrv = requests.get(f"https://api.fitbit.com/1/user/-/hrv/date/{today}.json", headers=headers).json()
-        stats["HRV"] = hrv['hrv'][0]['value']['dailyRmssd']
+        h = requests.get(f"https://api.fitbit.com/1/user/-/activities/heart/date/{date}/1d.json", headers=headers).json()
+        data["RHR"] = h['activities-heart'][0]['value']['restingHeartRate']
     except:
-        return {"Error": "Token Expired. Please refresh."}
-    return stats
+        data["Note"] = "Could not pull data (check if you wore watch last night)"
+    return data
 
 with tab1:
     if st.button("🚨 LOG DIZZY SPELL NOW", use_container_width=True):
-        stats = get_fb_stats()
+        fb_stats = fetch_fitbit()
         # Get Pressure
-        res = requests.get(f"https://api.openweathermap.org/data/2.5/weather?q=Auckland&appid={st.secrets['OPENWEATHER_KEY']}").json()
-        pressure = res['main']['pressure']
+        w_url = f"https://api.openweathermap.org/data/2.5/weather?q=Auckland&appid={WEATHER_KEY}"
+        pressure = requests.get(w_url).json()['main']['pressure']
         
-        entry = {"Time": datetime.datetime.now().strftime("%H:%M"), "Pressure": pressure, **stats}
-        st.write("Logged Data:", entry)
-        st.success("Captured everything.")
+        entry = {
+            "Time": datetime.datetime.now().strftime("%H:%M"),
+            "Pressure": pressure,
+            **fb_stats
+        }
+        st.write("Captured Stats:", entry)
+        st.balloons()
 
 with tab2:
-    st.subheader("Food Scanner")
-    # (AI Food code goes here - same as previous version)
+    st.subheader("Food & Water AI")
+    uploaded_file = st.file_uploader("Snap meal photo", type=["jpg", "png", "jpeg"])
+    if uploaded_file:
+        if st.button("Analyze with AI"):
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            response = model.generate_content([
+                "Return ONLY a JSON list: Sodium(mg), Caffeine(mg), Water(oz), Sweeteners(type).",
+                {"mime_type": "image/jpeg", "data": uploaded_file.getvalue()}
+            ])
+            st.info(response.text)
